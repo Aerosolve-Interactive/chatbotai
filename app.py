@@ -1,4 +1,10 @@
-# app.py — Slate API v0.4 (English math + writing + safe code runner; no 500s)
+# app.py — Slate API v0.4.1
+# - Plain-English math (solve/roots/derivative/integral/simplify/“what is …”)
+# - Writing coach (shorten/explain/rewrite). Uses OpenAI if OPENAI_API_KEY is set; else safe fallback.
+# - Safe Python code runner (no network/shell; CPU/RAM/time limits)
+# - Never 500s (all exceptions returned as JSON)
+# Endpoints: GET / , GET /health , POST /chat
+
 from typing import Literal, Optional, Dict, Any
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
@@ -6,15 +12,33 @@ from fastapi.responses import HTMLResponse, Response
 from pydantic import BaseModel
 import os, re, tempfile, subprocess, sys, textwrap, json
 
+# ========== Math stack ==========
 import sympy as sp
 from sympy.parsing.sympy_parser import (
     parse_expr, standard_transformations,
     implicit_multiplication_application, convert_xor,
 )
 
-app = FastAPI(title="Slate API", version="0.4")
+# ---- JSON-safe stringify for SymPy/containers (prevents 500s) ----
+def _stringify(obj):
+    """Recursively convert SymPy objects (and dict KEYS) to plain strings; turn sets/tuples into lists."""
+    try:
+        import sympy as _sp
+        if isinstance(obj, (_sp.Basic,)):
+            return str(obj)
+    except Exception:
+        pass
+    if isinstance(obj, dict):
+        return {str(k): _stringify(v) for k, v in obj.items()}
+    if isinstance(obj, (list, tuple)):
+        return [_stringify(v) for v in obj]
+    if isinstance(obj, set):
+        return [_stringify(v) for v in obj]
+    return obj
 
-# --- CORS: open for MVP; lock to your Wix domain later ---
+app = FastAPI(title="Slate API", version="0.4.1")
+
+# CORS: keep "*" for MVP; lock to your Wix domain later.
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
@@ -27,21 +51,21 @@ app.add_middleware(
 # Math (plain English) tool
 # =========================
 TRANSFORMS = standard_transformations + (
-    implicit_multiplication_application,  # "5x" -> 5*x
+    implicit_multiplication_application,  # "5x" -> 5*x , "2(x+1)" -> 2*(x+1)
     convert_xor,                          # "^"  -> "**"
 )
 
 def sp_parse(s: str):
     s = (s or "").strip()
     s = s.replace("−", "-").replace("–", "-").replace("—", "-")
-    s = s.replace("ln", "log")
+    s = s.replace("ln", "log")  # SymPy uses log() for natural log
     return parse_expr(s, transformations=TRANSFORMS)
 
 def english_to_math(text: str) -> Dict[str, Any]:
     raw = (text or "").strip()
     low = raw.lower()
 
-    # Solve explicit equation
+    # Solve explicit equation when user hints solving
     if "=" in raw and any(k in low for k in ("solve", "for x", "for y", "root", "roots", "zeros", "zeroes")):
         L, R = raw.split("=", 1)
         return {"op": "solve", "left": L, "right": R}
@@ -58,7 +82,8 @@ def english_to_math(text: str) -> Dict[str, Any]:
     m = re.search(r"\bsolve\s+for\s+([a-z])\s*:\s*(.+)", raw, flags=re.I)
     if m:
         var, eq = m.group(1), m.group(2)
-        L, R = (eq.split("=", 1) + ["0"])[:2] if "=" in eq else (eq, "0")
+        if "=" in eq: L, R = eq.split("=", 1)
+        else: L, R = eq, "0"
         return {"op": "solve", "left": L, "right": R, "var": var}
 
     # Derivative
@@ -75,7 +100,7 @@ def english_to_math(text: str) -> Dict[str, Any]:
     m = re.search(r"\bsimplify\b\s+(.+)", raw, flags=re.I)
     if m: return {"op": "simplify", "expr": m.group(1)}
 
-    # Evaluate
+    # Evaluate / compute / what's ...
     if any(k in low for k in ("what is", "what's", "whats", "value of", "compute", "evaluate")):
         expr = re.sub(r".*?(what is|what's|whats|value of|compute|evaluate)\s*", "", raw, flags=re.I)
         return {"op": "eval", "expr": expr}
@@ -95,8 +120,13 @@ def math_tool(text: str) -> Dict[str, Any]:
             eq = sp.Eq(L, R)
             syms = sorted(eq.free_symbols, key=lambda s: s.name)
             var = syms[0] if syms else sp.symbols(spec.get("var", "x"))
-            sol = sp.solve(eq, var, dict=True)
-            return {"type": "solve", "equation": str(eq), "symbol": str(var), "solution": sol}
+            sol = sp.solve(eq, var, dict=True)   # SymPy objects
+            return {
+                "type": "solve",
+                "equation": str(eq),
+                "symbol": str(var),
+                "solution": _stringify(sol),   # JSON-safe
+            }
         if op == "diff":
             x = sp.symbols("x")
             expr = sp_parse(spec["expr"])
@@ -205,7 +235,7 @@ def writing_tool(text: str) -> Dict[str, Any]:
         out = llm_rewrite(prompt)
         if out:
             return {"type": task["task"], "engine":"llm", "output": out}
-        # fallback
+        # Fallbacks (no API key)
         if task["task"] == "shorten":
             return {"type":"shorten","engine":"fallback","output": fallback_shorten(content, task.get("target"))}
         if task["task"] == "explain":
@@ -226,7 +256,7 @@ def extract_code(text: str) -> str:
 
 def safe_run_python(code: str) -> Dict[str, Any]:
     try:
-        # quick syntax check
+        # syntax check
         import ast
         try:
             ast.parse(code)
@@ -266,7 +296,7 @@ runpy.run_path("main.py", run_name="__main__")
                 "syntax":"ok",
                 "ran": True,
                 "returncode": proc.returncode,
-                "stdout": proc.stdout[-8000:],  # cap
+                "stdout": proc.stdout[-8000:],  # cap size
                 "stderr": proc.stderr[-8000:],
                 "timeout": False
             }
@@ -293,7 +323,7 @@ class ChatIn(BaseModel):
 def index():
     return f"""
     <html><body style="font-family:ui-sans-serif;background:#0b0b0c;color:#e7e7ea">
-      <h3>Slate API v0.4</h3>
+      <h3>Slate API v0.4.1</h3>
       <ul>
         <li><a href="/health" style="color:#8b5cf6">/health</a></li>
         <li><a href="/docs" style="color:#8b5cf6">/docs</a> (test POST /chat here)</li>
