@@ -1,10 +1,10 @@
-# app.py (v2: English-friendly math + index + favicon)
-import re
+# app.py — Slate API v0.4 (English math + writing + safe code runner; no 500s)
 from typing import Literal, Optional, Dict, Any
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import HTMLResponse, Response
 from pydantic import BaseModel
+import os, re, tempfile, subprocess, sys, textwrap, json
 
 import sympy as sp
 from sympy.parsing.sympy_parser import (
@@ -12,10 +12,9 @@ from sympy.parsing.sympy_parser import (
     implicit_multiplication_application, convert_xor,
 )
 
-# ---------- FastAPI ----------
-app = FastAPI(title="SchoolBot API", version="0.2.0")
+app = FastAPI(title="Slate API", version="0.4")
 
-# CORS: open for MVP; lock to your Wix domain in production
+# --- CORS: open for MVP; lock to your Wix domain later ---
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
@@ -24,152 +23,277 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# ---------- Parsing helpers ----------
+# =========================
+# Math (plain English) tool
+# =========================
 TRANSFORMS = standard_transformations + (
     implicit_multiplication_application,  # "5x" -> 5*x
     convert_xor,                          # "^"  -> "**"
 )
 
 def sp_parse(s: str):
-    """SymPy parse with implicit multiplication and ^ support."""
+    s = (s or "").strip()
+    s = s.replace("−", "-").replace("–", "-").replace("—", "-")
+    s = s.replace("ln", "log")
     return parse_expr(s, transformations=TRANSFORMS)
 
-def cleanup_math_text(t: str) -> str:
-    """Normalize common english-y inputs a bit."""
-    # Replace unicode minus and weird spaces
-    t = t.replace("−", "-").replace("–", "-").replace("—", "-")
-    # Remove trailing 'for x' etc.
-    t = re.sub(r"\bfor\s+x\b", "", t, flags=re.I)
-    return t.strip()
-
 def english_to_math(text: str) -> Dict[str, Any]:
-    """
-    Very small rule-based layer:
-    - 'solve ... = ...', 'find the roots of ...', 'roots of ...'
-    - 'derivative of ...', 'differentiate ...', 'd/dx ...'
-    - 'integral of ...', 'antiderivative of ...', 'integrate ...'
-    - 'simplify ...'
-    Returns a dict spec or {} if not recognized.
-    """
-    raw = text.strip()
-    low = raw.lower().strip()
-    t = cleanup_math_text(raw)
+    raw = (text or "").strip()
+    low = raw.lower()
 
-    # Solve / roots
-    if any(k in low for k in ["solve", "roots of", "root of", "zeros of", "zeroes of", "find the roots"]):
-        # Prefer explicit equation
-        m = re.search(r"(.+?)=\s*(.+)", t)
-        if m:
-            left, right = m.group(1), m.group(2)
-        else:
-            # try "roots of <expr>"
-            m = re.search(r"(?:roots?|zeros?|zeroes?)\s+of\s+(.+)", low)
-            if m:
-                left, right = m.group(1), "0"
-            else:
-                # try "solve <expr>" -> = 0
-                m = re.search(r"solve\s+(.+)", low)
-                if m:
-                    left, right = m.group(1), "0"
-                else:
-                    # not enough info
-                    return {}
-        return {"op":"solve", "left": left, "right": right}
+    # Solve explicit equation
+    if "=" in raw and any(k in low for k in ("solve", "for x", "for y", "root", "roots", "zeros", "zeroes")):
+        L, R = raw.split("=", 1)
+        return {"op": "solve", "left": L, "right": R}
+
+    # "roots of f(x)"
+    m = re.search(r"(?:roots?|zeros?|zeroes?)\s+of\s+(.+)", raw, flags=re.I)
+    if m: return {"op": "solve", "left": m.group(1), "right": "0"}
+
+    # "solve ..." (assume = 0)
+    m = re.search(r"\bsolve\b\s+(.+)", raw, flags=re.I)
+    if m: return {"op": "solve", "left": m.group(1), "right": "0"}
+
+    # "solve for x: 2x+3=7"
+    m = re.search(r"\bsolve\s+for\s+([a-z])\s*:\s*(.+)", raw, flags=re.I)
+    if m:
+        var, eq = m.group(1), m.group(2)
+        L, R = (eq.split("=", 1) + ["0"])[:2] if "=" in eq else (eq, "0")
+        return {"op": "solve", "left": L, "right": R, "var": var}
 
     # Derivative
-    if any(k in low for k in ["derivative of", "differentiate", "d/dx "]):
-        expr = low
-        # d/dx f(x)
-        m = re.search(r"d\/dx\s+(.+)", low)
-        if m:
-            expr = m.group(1)
-        else:
-            m = re.search(r"(?:derivative of|differentiate)\s+(.+)", low)
-            if m:
-                expr = m.group(1)
-        return {"op":"diff", "expr": expr}
+    m = re.search(r"\bd\/dx\b\s+(.+)", raw, flags=re.I)
+    if m: return {"op": "diff", "expr": m.group(1)}
+    m = re.search(r"(?:derivative of|differentiate)\s+(.+)", raw, flags=re.I)
+    if m: return {"op": "diff", "expr": m.group(1)}
 
     # Integral
-    if any(k in low for k in ["integral of", "antiderivative of", "integrate "]):
-        m = re.search(r"(?:integral of|antiderivative of|integrate)\s+(.+)", low)
-        if m:
-            return {"op":"integrate", "expr": m.group(1)}
+    m = re.search(r"(?:integral of|antiderivative of|integrate)\s+(.+)", raw, flags=re.I)
+    if m: return {"op": "integrate", "expr": m.group(1)}
 
     # Simplify
-    if "simplify" in low:
-        m = re.search(r"simplify\s+(.+)", low)
-        if m:
-            return {"op":"simplify", "expr": m.group(1)}
+    m = re.search(r"\bsimplify\b\s+(.+)", raw, flags=re.I)
+    if m: return {"op": "simplify", "expr": m.group(1)}
 
-    # Fallback: check if the raw text looks like an equation or bare expression
-    if "=" in t:
-        left, right = t.split("=", 1)
-        return {"op":"solve", "left": left, "right": right}
-    # bare expression -> try simplify
-    return {"op":"simplify", "expr": t}
+    # Evaluate
+    if any(k in low for k in ("what is", "what's", "whats", "value of", "compute", "evaluate")):
+        expr = re.sub(r".*?(what is|what's|whats|value of|compute|evaluate)\s*", "", raw, flags=re.I)
+        return {"op": "eval", "expr": expr}
 
-# ---------- Tools ----------
+    # Fallbacks
+    if "=" in raw:
+        L, R = raw.split("=", 1)
+        return {"op": "solve", "left": L, "right": R}
+    return {"op": "eval", "expr": raw}
+
 def math_tool(text: str) -> Dict[str, Any]:
-    spec = english_to_math(text)
     try:
-        if not spec:
-            return {"error":"Unrecognized math intent. Try: 'solve x^2-5x+6=0', 'derivative of ...', 'integral of ...', or 'simplify ...'."}
-        if spec["op"] == "solve":
-            left, right = sp_parse(spec["left"]), sp_parse(spec["right"])
-            eq = sp.Eq(left, right)
-            syms = sorted(eq.free_symbols, key=lambda s: s.name) or [sp.symbols("x") ]
-            sol = sp.solve(eq, syms[0], dict=True)
-            return {"type":"solve", "equation": str(eq), "symbol": str(syms[0]), "solution": sol}
-        if spec["op"] == "diff":
+        spec = english_to_math(text)
+        op = spec.get("op")
+        if op == "solve":
+            L, R = sp_parse(spec["left"]), sp_parse(spec["right"])
+            eq = sp.Eq(L, R)
+            syms = sorted(eq.free_symbols, key=lambda s: s.name)
+            var = syms[0] if syms else sp.symbols(spec.get("var", "x"))
+            sol = sp.solve(eq, var, dict=True)
+            return {"type": "solve", "equation": str(eq), "symbol": str(var), "solution": sol}
+        if op == "diff":
             x = sp.symbols("x")
             expr = sp_parse(spec["expr"])
-            return {"type":"diff", "expr": str(expr), "d/dx": str(sp.diff(expr, x))}
-        if spec["op"] == "integrate":
+            return {"type": "diff", "expr": str(expr), "d/dx": str(sp.diff(expr, x))}
+        if op == "integrate":
             x = sp.symbols("x")
             expr = sp_parse(spec["expr"])
-            return {"type":"integrate", "expr": str(expr), "∫dx": str(sp.integrate(expr, x))}
-        if spec["op"] == "simplify":
+            return {"type": "integrate", "expr": str(expr), "∫dx": str(sp.integrate(expr, x))}
+        if op == "simplify":
             expr = sp_parse(spec["expr"])
-            return {"type":"simplify", "expr": str(expr), "simplified": str(sp.simplify(expr))}
-        return {"error":"Unknown math op."}
+            return {"type": "simplify", "expr": str(expr), "simplified": str(sp.simplify(expr))}
+        if op == "eval":
+            expr = sp_parse(spec["expr"])
+            if not expr.free_symbols:
+                return {"type": "eval", "expr": str(expr), "value": str(sp.N(expr))}
+            return {"type": "eval", "expr": str(expr), "simplified": str(sp.simplify(expr))}
+        return {"error": "Unrecognized math intent."}
     except Exception as e:
         return {"error": f"Math parse/solve failed: {e}"}
 
-def code_tool(snippet: str, language: str="python") -> Dict[str, Any]:
-    if language.lower() != "python":
-        return {"error":"Only Python syntax-check MVP. Add Docker sandbox for execution."}
-    import ast
+# ==================
+# Writing coach tool
+# ==================
+_OPENAI_AVAILABLE = False
+try:
+    from openai import OpenAI
+    _client = OpenAI(api_key=os.getenv("OPENAI_API_KEY", None))
+    _model = os.getenv("OPENAI_MODEL", "gpt-4o-mini")
+    _OPENAI_AVAILABLE = bool(os.getenv("OPENAI_API_KEY"))
+except Exception:
+    _OPENAI_AVAILABLE = False
+
+WRITING_SYSTEM = (
+    "You are a strict but helpful writing tutor for grades 7–12. "
+    "Follow the instruction (shorten, explain, rewrite) while preserving meaning and citations. "
+    "Prefer clarity, concision, active voice. Return ONLY the revised text."
+)
+
+def llm_rewrite(prompt: str) -> Optional[str]:
+    if not _OPENAI_AVAILABLE:
+        return None
     try:
-        ast.parse(snippet)
-        return {"syntax":"ok","advice":["Add pytest tests","Run ruff/black","Handle edge cases"]}
-    except SyntaxError as e:
-        return {"syntax":"error","detail": f"{e.msg} at {e.lineno}:{e.offset}"}
+        resp = _client.chat.completions.create(
+            model=_model,
+            messages=[{"role":"system","content":WRITING_SYSTEM},{"role":"user","content":prompt}],
+            temperature=0.2,
+        )
+        return resp.choices[0].message.content.strip()
+    except Exception:
+        return None
 
-def writing_tool(prompt: str, grade: int=9, length: int=600) -> Dict[str, Any]:
-    return {
-        "thesis":"<Arguable thesis responding to the prompt>",
-        "claims":[
-            {"claim":"Distinct Claim 1", "evidence_prompts":["Key fact/example","Short quote (Author, Year)"]},
-            {"claim":"Distinct Claim 2", "evidence_prompts":["Dataset/figure","Counterexample + rebuttal"]},
-            {"claim":"Distinct Claim 3 (optional)", "evidence_prompts":["Historical context","Expert opinion"]}
-        ],
-        "structure":["Intro (hook→context→thesis)","Body 1","Body 2","Body 3","Conclusion (so what?)"],
-        "revision_checklist":["Clarity","Concision","Citations present","Sentence variety","Active voice"],
-        "integrity_note":"Use as a study aid. Write in your own words and cite sources.",
-        "target_grade":grade, "target_length":length
-    }
+def detect_writing_task(text: str) -> Dict[str, Any]:
+    low = (text or "").lower()
+    if "shorten" in low or "condense" in low or "make it shorter" in low:
+        m = re.search(r"(?:shorten|condense).{0,40}?(\d+)\s*(?:words|w)", low)
+        return {"task":"shorten", "target": int(m.group(1)) if m else None}
+    if "explain" in low or "simplify" in low or "make it simpler" in low:
+        m = re.search(r"(?:grade|reading level)\s*(\d+)", low)
+        return {"task":"explain", "grade": int(m.group(1)) if m else 9}
+    if any(k in low for k in ["rewrite","rephrase","improve","fix grammar"]):
+        m = re.search(r"(?:tone|style)\s*(formal|casual|academic|concise)", low)
+        return {"task":"rewrite", "tone": m.group(1) if m else "concise academic"}
+    return {"task":"rewrite", "tone":"concise academic"}
 
-# ---------- API ----------
+def fallback_shorten(text: str, target: Optional[int]) -> str:
+    words = text.split()
+    if target and target < len(words):
+        sents = re.split(r"(?<=[.!?])\s+", text.strip())
+        out, count = [], 0
+        for s in sents:
+            w = len(s.split())
+            if count + w <= target or not out:
+                out.append(s); count += w
+            else:
+                break
+        return " ".join(out)
+    return re.sub(r"\s+", " ", text).strip()
+
+def fallback_explain(text: str, grade: int) -> str:
+    sents = re.split(r"(?<=[.!?])\s+", text.strip())
+    simplified = []
+    for s in sents:
+        s = re.sub(r"\s+", " ", s.strip())
+        if len(s) > 220:
+            parts = re.split(r"(;|,|\band\b)", s)
+            s = " ".join(parts[:max(2, len(parts)//2)])
+        simplified.append(s)
+    return " ".join(simplified)
+
+def fallback_rewrite(text: str, tone: str) -> str:
+    t = re.sub(r"\s+", " ", text).strip()
+    t = re.sub(r"\bi\b", "I", t)
+    return t
+
+def writing_tool(text: str) -> Dict[str, Any]:
+    try:
+        task = detect_writing_task(text)
+        m = re.search(r":\s*(.+)$", text, flags=re.S)
+        content = m.group(1) if m else text
+        if task["task"] == "shorten" and task.get("target"):
+            prompt = f"Shorten to about {task['target']} words:\n\n{content}"
+        elif task["task"] == "explain":
+            prompt = f"Explain at about grade {task.get('grade',9)} level. Keep key points:\n\n{content}"
+        else:
+            prompt = f"Rewrite in a {task.get('tone','concise academic')} tone, improve clarity/grammar:\n\n{content}"
+        out = llm_rewrite(prompt)
+        if out:
+            return {"type": task["task"], "engine":"llm", "output": out}
+        # fallback
+        if task["task"] == "shorten":
+            return {"type":"shorten","engine":"fallback","output": fallback_shorten(content, task.get("target"))}
+        if task["task"] == "explain":
+            return {"type":"explain","engine":"fallback","output": fallback_explain(content, task.get("grade",9))}
+        return {"type":"rewrite","engine":"fallback","output": fallback_rewrite(content, task.get("tone","concise academic"))}
+    except Exception as e:
+        return {"error": f"Writing tool failed: {e}"}
+
+# ===================
+# Code tool + runner
+# ===================
+def extract_code(text: str) -> str:
+    m = re.search(r"```(?:python)?\s*(.*?)```", text, flags=re.S)
+    if m: return m.group(1)
+    if text.lower().startswith("run:"):
+        return text.split(":",1)[1]
+    return text
+
+def safe_run_python(code: str) -> Dict[str, Any]:
+    try:
+        # quick syntax check
+        import ast
+        try:
+            ast.parse(code)
+        except SyntaxError as e:
+            return {"syntax":"error","detail": f"{e.msg} at {e.lineno}:{e.offset}"}
+
+        with tempfile.TemporaryDirectory() as td:
+            main_py = os.path.join(td, "main.py")
+            wrapper_py = os.path.join(td, "wrapper.py")
+            open(main_py, "w", encoding="utf-8").write(code)
+
+            wrapper = r"""
+import sys, os, runpy
+# resource limits (Linux-only)
+try:
+    import resource
+    resource.setrlimit(resource.RLIMIT_CPU, (2,2))
+    resource.setrlimit(resource.RLIMIT_AS, (256*1024*1024, 256*1024*1024))
+except Exception:
+    pass
+# block networking and shell-outs
+import socket, subprocess
+def _block(*a, **k): raise RuntimeError("disabled")
+socket.socket = _block
+subprocess.Popen = _block
+os.system = _block
+# run user code
+runpy.run_path("main.py", run_name="__main__")
+"""
+            open(wrapper_py, "w", encoding="utf-8").write(wrapper)
+
+            proc = subprocess.run(
+                [sys.executable, "-I", "wrapper.py"],
+                cwd=td, capture_output=True, timeout=3, text=True
+            )
+            return {
+                "syntax":"ok",
+                "ran": True,
+                "returncode": proc.returncode,
+                "stdout": proc.stdout[-8000:],  # cap
+                "stderr": proc.stderr[-8000:],
+                "timeout": False
+            }
+    except subprocess.TimeoutExpired:
+        return {"syntax":"ok","ran": True, "timeout": True, "stdout":"", "stderr":"Timed out after 3s"}
+    except Exception as e:
+        return {"error": f"Runner failed: {e}"}
+
+def code_tool(text: str) -> Dict[str, Any]:
+    try:
+        code = extract_code(text)
+        return safe_run_python(code)
+    except Exception as e:
+        return {"error": f"Code tool failed: {e}"}
+
+# =========
+# API layer
+# =========
 class ChatIn(BaseModel):
-    mode: Literal["auto","math","code","write"] = "auto"
+    mode: Literal["auto","math","write","code"] = "auto"
     text: str
-    extra: Optional[Dict[str, Any]] = None
 
 @app.get("/", response_class=HTMLResponse)
 def index():
-    return """
+    return f"""
     <html><body style="font-family:ui-sans-serif;background:#0b0b0c;color:#e7e7ea">
-      <h3>SchoolBot API v0.2</h3>
+      <h3>Slate API v0.4</h3>
       <ul>
         <li><a href="/health" style="color:#8b5cf6">/health</a></li>
         <li><a href="/docs" style="color:#8b5cf6">/docs</a> (test POST /chat here)</li>
@@ -183,26 +307,26 @@ def favicon():
 
 @app.get("/health")
 def health():
-    return {"status":"ok"}
+    return {"status": "ok"}
 
-def route(mode: str, text: str, extra: Optional[Dict[str, Any]]):
+def route(mode: str, text: str):
     t = (text or "").strip()
-    if not t:
-        return {"error":"Empty prompt."}
+    if not t: return {"error":"Empty prompt."}
     low = t.lower()
-    if mode=="math" or (mode=="auto" and any(k in low for k in ["solve","root","zero","derivative","differentiate","d/dx","integral","integrate","simplify","^","="])):
-        return {"mode":"math", "result": math_tool(t)}
-    if mode=="code" or (mode=="auto" and any(k in low for k in ["python","java","bug","error","function","class","compile","code"])):
-        lang = (extra or {}).get("language","python")
-        return {"mode":"code","result": code_tool(t, lang)}
-    # default -> writing coach
-    grade = int((extra or {}).get("grade", 9))
-    length = int((extra or {}).get("length", 600))
-    return {"mode":"write","result": writing_tool(t, grade, length)}
+    is_mathy = any(k in low for k in [
+        "solve","root","zero","derivative","differentiate","d/dx","integral","integrate",
+        "simplify","value of","compute","evaluate","what is","what's","whats","=","^"
+    ])
+    is_codey = any(k in low for k in ["```", "def ", "class ", "run:", "python"])
+    if mode == "math" or (mode == "auto" and is_mathy):
+        return {"mode":"math","result": math_tool(t)}
+    if mode == "code" or (mode == "auto" and is_codey):
+        return {"mode":"code","result": code_tool(t)}
+    return {"mode":"write","result": writing_tool(t)}
 
 @app.post("/chat")
 def chat(payload: ChatIn):
     try:
-        return route(payload.mode, payload.text, payload.extra)
+        return route(payload.mode, payload.text)
     except Exception as e:
         return {"error": f"Server error: {e}"}
