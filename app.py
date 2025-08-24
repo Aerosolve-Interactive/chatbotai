@@ -338,7 +338,7 @@ WIDGET_HTML = """<!doctype html>
 <title>Slate — Study Assistant</title>
 <style>
   :root{--bg:#0b0b0c;--panel:#121214;--panel-2:#17171a;--text:#e7e7ea;--muted:#a1a1aa;--accent:#8b5cf6;--radius:16px;--shadow:0 10px 30px rgba(0,0,0,.35)}
-  *{box-sizing:border-box} html,body{height:100%} body{margin:0;font-family:ui-sans-serif,system-ui,-apple-system,Inter,Segoe UI,Roboto,Arial;background:var(--bg);color:var(--text)}
+  *{box-sizing:border-box} html,body{height:100%} body{margin:0;font-family:ui-sans-serif,system-ui,-apple-system,Inter,Segoe UI,Roboto,Arial;background:var(--bg);color:var(--text);line-height:1.5}
   .wrap{display:flex;flex-direction:column;height:100%;padding:16px;background:linear-gradient(180deg, rgba(255,255,255,.03), transparent 20%)}
   .card{flex:1;display:flex;flex-direction:column;background:var(--panel);border:1px solid #222226;border-radius:16px;box-shadow:var(--shadow);overflow:hidden}
   .header{display:flex;align-items:center;justify-content:space-between;padding:14px 16px;border-bottom:1px solid #222226;background:var(--panel-2)}
@@ -350,105 +350,136 @@ WIDGET_HTML = """<!doctype html>
   .msg{max-width:88%;padding:10px 12px;border-radius:12px;font-size:14px;white-space:pre-wrap;word-wrap:break-word;border:1px solid #24242a}
   .msg.user{align-self:flex-end;background:#101014;border-color:#2a2a31}.msg.bot{align-self:flex-start;background:#0f0f12}
   .footer{display:flex;gap:8px;padding:12px;border-top:1px solid #222226;background:var(--panel-2)}
-  textarea{flex:1;resize:none;background:#0f0f12;color:var(--text);border:1px solid #26262c;border-radius:12px;padding:10px 12px;min-height:48px;max-height:160px;outline:none}
+  textarea{flex:1;resize:none;background:#0f0f12;color:#e7e7ea;border:1px solid #26262c;border-radius:12px;padding:10px 12px;min-height:48px;max-height:160px;outline:none}
   .send{background:var(--accent);color:#fff;border:0;border-radius:12px;padding:0 16px;cursor:pointer;font-weight:600}
-  .hint{color:var(--muted);font-size:12px;padding:0 14px 12px}.small{font-size:12px;color:var(--muted)}
+  .hint{color:var(--muted);font-size:12px;padding:0 14px 12px}
 </style>
 </head>
 <body>
-<div class="wrap"><div class="card">
-  <div class="header">
-    <div class="brand"><span class="dot"></span><span>Slate</span><span class="small">· math · code · writing</span></div>
-    <div class="seg" role="tablist" aria-label="Mode">
-      <button class="active" data-mode="auto">Auto</button>
-      <button data-mode="math">Math</button>
-      <button data-mode="code">Code</button>
-      <button data-mode="write">Writing</button>
+  <div class="wrap">
+    <div class="card">
+      <div class="header">
+        <div class="brand"><span class="dot"></span><span>Slate</span><span style="color:#a1a1aa;font-size:12px">· math · code · writing</span></div>
+        <div id="slate-seg" class="seg" role="tablist" aria-label="Mode">
+          <button class="active" data-mode="auto">Auto</button>
+          <button data-mode="math">Math</button>
+          <button data-mode="code">Code</button>
+          <button data-mode="write">Writing</button>
+        </div>
+      </div>
+      <div id="slate-chat" class="chat" aria-live="polite"></div>
+      <div class="hint">Enter to send • Shift+Enter for newline</div>
+      <div class="footer">
+        <textarea id="slate-input" placeholder="Ask in plain English. e.g., ‘Find the roots of x^2 - 5x + 6’ or ‘Shorten to 120 words: …’"></textarea>
+        <button id="slate-send" class="send" type="button">Send</button>
+      </div>
     </div>
   </div>
-  <div id="chat" class="chat" aria-live="polite"></div>
-  <div class="hint">Enter to send • Shift+Enter for newline</div>
-  <div class="footer">
-    <textarea id="input" placeholder="Ask in plain English. e.g., “Find the roots of x^2 - 5x + 6”, or start with ‘Shorten to 120 words:’"></textarea>
-    <button id="send" class="send">Send</button>
-  </div>
-</div></div>
 
 <script>
-  const BACKEND_URL = "https://slate-ai.onrender.com"; // your API
+document.addEventListener("DOMContentLoaded", function () {
+  const BACKEND_URL = "https://slate-ai.onrender.com";
 
-  const chat = document.getElementById("chat");
-  const input = document.getElementById("input");
-  const sendBtn = document.getElementById("send");
-  const modeButtons = Array.from(document.querySelectorAll(".seg button"));
-  let currentMode="auto", sending=false, warmedOnce=false;
+  const chat = document.getElementById("slate-chat");
+  const input = document.getElementById("slate-input");
+  const sendBtn = document.getElementById("slate-send");
+  const seg = document.getElementById("slate-seg");
+  let currentMode = "auto";
+  let sending = false;
+  let warmedOnce = false;
 
-  modeButtons.forEach(b=>{
-    b.addEventListener("click", ()=>{
-      modeButtons.forEach(x=>x.classList.remove("active"));
-      b.classList.add("active"); currentMode=b.dataset.mode;
+  seg.querySelectorAll("button").forEach(btn => {
+    btn.addEventListener("click", () => {
+      seg.querySelectorAll("button").forEach(b => b.classList.remove("active"));
+      btn.classList.add("active");
+      currentMode = btn.dataset.mode;
     });
   });
 
   function addMsg(text, who="bot"){
-    const div=document.createElement("div");
-    div.className="msg "+(who==="user"?"user":"bot");
-    div.textContent=text; chat.appendChild(div); chat.scrollTop=chat.scrollHeight;
+    const div = document.createElement("div");
+    div.className = "msg " + (who === "user" ? "user" : "bot");
+    div.textContent = text;
+    chat.appendChild(div);
+    chat.scrollTop = chat.scrollHeight;
   }
 
   function renderResult(obj){
     if(!obj) return addMsg("No response.","bot");
-    if(obj.error) return addMsg("Error: "+obj.error,"bot");
-    const {mode, result}=obj;
-    if(mode==="math"){
-      if(result.error) return addMsg("Math error: "+result.error,"bot");
-      if(result.type==="solve"){
-        addMsg(\`Equation: \${result.equation}\nSymbol: \${result.symbol}\nSolution: \${JSON.stringify(result.solution,null,2)}\`,"bot");
-      } else if(result.type==="diff"){
-        addMsg(\`d/dx of \${result.expr} = \${result["d/dx"]}\`,"bot");
-      } else if(result.type==="integrate"){
-        addMsg(\`∫ \${result.expr} dx = \${result["∫dx"]}\`,"bot");
-      } else if(result.type==="simplify"){
-        addMsg(\`Simplified \${result.expr} → \${result.simplified}\`,"bot");
-      } else if(result.type==="eval"){
-        if(result.value!==undefined) addMsg(\`Value: \${result.value}\`,"bot");
-        else addMsg(\`Simplified \${result.expr} → \${result.simplified}\`,"bot");
-      } else { addMsg(JSON.stringify(result),"bot"); }
-    } else if(mode==="code"){
-      if(result.error) return addMsg("Code error: "+result.error,"bot");
-      if(result.syntax==="error") return addMsg("Syntax error: "+result.detail,"bot");
-      if(result.timeout) return addMsg("Your code timed out (3s limit).","bot");
-      const out=[]; out.push("Ran ✅");
-      if(result.stdout) out.push("stdout:\n"+result.stdout.trim());
-      if(result.stderr) out.push("stderr:\n"+result.stderr.trim());
-      addMsg(out.join("\\n\\n"),"bot");
-    } else if(mode==="write"){
-      if(result.error) return addMsg("Writing error: "+result.error,"bot");
-      addMsg(result.output || JSON.stringify(result),"bot");
-    } else { addMsg(JSON.stringify(result),"bot"); }
+    if(obj.error) return addMsg("Error: " + obj.error, "bot");
+    const {mode, result} = obj;
+    if(mode === "math"){
+      if(result.error) return addMsg("Math error: " + result.error, "bot");
+      if(result.type === "solve"){
+        addMsg(`Equation: ${result.equation}\nSymbol: ${result.symbol}\nSolution: ${JSON.stringify(result.solution, null, 2)}`, "bot");
+      } else if(result.type === "diff"){
+        addMsg(`d/dx of ${result.expr} = ${result["d/dx"]}`, "bot");
+      } else if(result.type === "integrate"){
+        addMsg(`∫ ${result.expr} dx = ${result["∫dx"]}`, "bot");
+      } else if(result.type === "simplify"){
+        addMsg(`Simplified ${result.expr} → ${result.simplified}`, "bot");
+      } else if(result.type === "eval"){
+        if(result.value !== undefined) addMsg(`Value: ${result.value}`, "bot");
+        else addMsg(`Simplified ${result.expr} → ${result.simplified}`, "bot");
+      } else addMsg(JSON.stringify(result), "bot");
+    } else if(mode === "code"){
+      if(result.error) return addMsg("Code error: " + result.error, "bot");
+      if(result.syntax === "error") return addMsg("Syntax error: " + result.detail, "bot");
+      if(result.timeout) return addMsg("Your code timed out (3s limit).", "bot");
+      const out = [];
+      out.push("Ran ✅");
+      if(result.stdout) out.push("stdout:\n" + result.stdout.trim());
+      if(result.stderr) out.push("stderr:\n" + result.stderr.trim());
+      addMsg(out.join("\\n\\n"), "bot");
+    } else if(mode === "write"){
+      if(result.error) return addMsg("Writing error: " + result.error, "bot");
+      addMsg(result.output || JSON.stringify(result), "bot");
+    } else {
+      addMsg(JSON.stringify(result), "bot");
+    }
   }
 
-  // renamed to avoid clobbering with element id="send"
   async function handleSend(){
     if(sending) return;
-    const text=input.value.trim(); if(!text) return;
-    addMsg(text,"user"); input.value=""; sending=true;
+    const text = input.value.trim();
+    if(!text) return;
+    addMsg(text, "user");
+    input.value = "";
+    sending = true;
 
-    let wakeHint=setTimeout(()=>addMsg("…waking the server (free tier cold start)…","bot"),1200);
+    let wakeHint = setTimeout(() => addMsg("…waking the server (free tier cold start)…", "bot"), 1200);
+
     try{
-      const resp=await fetch(BACKEND_URL+"/chat",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({mode:currentMode,text})});
-      const data=await resp.json(); clearTimeout(wakeHint); renderResult(data);
+      const resp = await fetch(BACKEND_URL + "/chat", {
+        method: "POST",
+        headers: {"Content-Type":"application/json"},
+        body: JSON.stringify({ mode: currentMode, text })
+      });
+      const data = await resp.json();
+      clearTimeout(wakeHint);
+      renderResult(data);
 
-      // Least-intensive keep-warm: ONE HEAD ping, ONCE, 2 min after first real request
-      if(!warmedOnce){ warmedOnce=true; setTimeout(()=>{ fetch(BACKEND_URL+"/health",{method:"HEAD",cache:"no-store"}).catch(()=>{}); }, 2*60*1000); }
-    }catch(e){ clearTimeout(wakeHint); addMsg("Network error: "+e.message,"bot"); }
-    finally{ sending=false; }
+      if(!warmedOnce){
+        warmedOnce = true;
+        setTimeout(() => {
+          fetch(BACKEND_URL + "/health", { method:"HEAD", cache:"no-store" }).catch(() => {});
+        }, 2 * 60 * 1000);
+      }
+    } catch(e){
+      clearTimeout(wakeHint);
+      addMsg("Network error: " + e.message, "bot");
+    } finally {
+      sending = false;
+    }
   }
 
   sendBtn.addEventListener("click", handleSend);
-  input.addEventListener("keydown",(e)=>{ if(e.key==="Enter" && !e.shiftKey){ e.preventDefault(); handleSend(); } });
+  input.addEventListener("keydown", (e) => {
+    if(e.key === "Enter" && !e.shiftKey){ e.preventDefault(); handleSend(); }
+  });
 
-  addMsg("Hi! I’m Slate. I solve math exactly (SymPy), run tiny Python snippets, and polish writing (shorten/explain/rewrite).","bot");
+  addMsg("Hi! I’m Slate. I can solve math (exact via SymPy), run small Python, and polish writing (shorten/explain/rewrite). Try: ‘find the roots of x^2 - 5x + 6’.", "bot");
+});
 </script>
 </body></html>"""
 
