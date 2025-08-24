@@ -320,4 +320,4 @@ def code_generate_tool(text: str) -> Dict[str, Any]:
              "messages":[{"role":"system","content":"Respond with ONLY code (no prose)."},
                          {"role":"user","content":text}]}
         )
-        if j and j.get("choices"
+        if j and j.get("choices"):
