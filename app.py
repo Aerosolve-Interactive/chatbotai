@@ -278,46 +278,84 @@ def _post_json(url: str, headers: Dict[str,str], payload: Dict[str,Any], timeout
         return None
 
 def code_generate_tool(text: str) -> Dict[str, Any]:
-    # Try LLMs in order: OpenAI -> Groq -> OpenRouter
+    """
+    Generate code for the user's request.
+    Order: OpenAI (if key) → Groq (if key) → OpenRouter (if key) → fallback.
+    Always return ONLY code in 'code'.
+    """
     lang = detect_language(text)
-    # OpenAI
+
+    # ---------- OpenAI ----------
     if _OPENAI_AVAILABLE:
         try:
             out = _client.chat.completions.create(
-                model=os.getenv("OPENAI_MODEL","gpt-4o-mini"),
-                messages=[{"role":"system","content":"Respond with ONLY code (no prose)."},
-                          {"role":"user","content":text}],
+                model=os.getenv("OPENAI_MODEL", "gpt-4o-mini"),
+                messages=[
+                    {"role": "system", "content": "Respond with ONLY code (no prose)."},
+                    {"role": "user", "content": text},
+                ],
                 temperature=0.2,
             ).choices[0].message.content.strip()
             m = re.search(r"```[^\n]*\n(.*?)```", out, flags=re.S)
             code = m.group(1).strip() if m else out
-            return {"type":"generate","engine":"llm","language":lang,"code":code}
+            return {"type": "generate", "engine": "llm", "language": lang, "code": code}
         except Exception:
-            pass
-    # Groq
+            pass  # fall through
+
+    # ---------- Groq ----------
     groq_key = os.getenv("GROQ_API_KEY")
     if groq_key:
         j = _post_json(
             "https://api.groq.com/openai/v1/chat/completions",
-            {"Authorization": f"Bearer {groq_key}","Content-Type":"application/json"},
-            {"model":"llama-3.1-70b-versatile","temperature":0.2,
-             "messages":[{"role":"system","content":"Respond with ONLY code (no prose)."},
-                         {"role":"user","content":text}]}
+            {"Authorization": f"Bearer {groq_key}", "Content-Type": "application/json"},
+            {
+                "model": "llama-3.1-70b-versatile",
+                "temperature": 0.2,
+                "messages": [
+                    {"role": "system", "content": "Respond with ONLY code (no prose)."},
+                    {"role": "user", "content": text},
+                ],
+            },
         )
         if j and j.get("choices"):
             out = j["choices"][0]["message"]["content"].strip()
             m = re.search(r"```[^\n]*\n(.*?)```", out, flags=re.S)
             code = m.group(1).strip() if m else out
-            return {"type":"generate","engine":"llm-groq","language":lang,"code":code}
-    # OpenRouter
+            return {"type": "generate", "engine": "llm-groq", "language": lang, "code": code}
+
+    # ---------- OpenRouter ----------
     or_key = os.getenv("OPENROUTER_API_KEY")
     if or_key:
         j = _post_json(
             "https://openrouter.ai/api/v1/chat/completions",
-            {"Authorization": f"Bearer {or_key}","Content-Type":"application/json"},
-            {"model": os.getenv("OPENROUTER_MODEL","meta-llama/llama-3.1-70b-instruct:free"),
-             "temperature":0.2,
-             "messages":[{"role":"system","content":"Respond with ONLY code (no prose)."},
-                         {"role":"user","content":text}]}
+            {"Authorization": f"Bearer {or_key}", "Content-Type": "application/json"},
+            {
+                "model": os.getenv("OPENROUTER_MODEL", "meta-llama/llama-3.1-70b-instruct:free"),
+                "temperature": 0.2,
+                "messages": [
+                    {"role": "system", "content": "Respond with ONLY code (no prose)."},
+                    {"role": "user", "content": text},
+                ],
+            },
         )
         if j and j.get("choices"):
+            out = j["choices"][0]["message"]["content"].strip()
+            m = re.search(r"```[^\n]*\n(.*?)```", out, flags=re.S)
+            code = m.group(1).strip() if m else out
+            return {"type": "generate", "engine": "llm-openrouter", "language": lang, "code": code}
+
+    # ---------- Fallbacks ----------
+    low = (text or "").lower()
+    if "hello world" in low or ("print" in low and "hello" in low):
+        return {"type": "generate", "engine": "fallback", "language": lang, "code": codegen_hello(lang)}
+
+    return {
+        "type": "generate",
+        "engine": "fallback",
+        "language": lang,
+        "code": (
+            "// Describe exactly what to build.\n"
+            "// Example: Write a function in Python that returns the nth Fibonacci number.\n"
+        ),
+    }
+
