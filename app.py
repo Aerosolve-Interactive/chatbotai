@@ -2,10 +2,10 @@
 # Auto intent (math / code-generate / code-run / writing / general-knowledge)
 # Math: SymPy; Writing: shorten/explain/rewrite/lengthen (LLM if key, else fallback)
 # Code: generate (LLM or fallback) OR run (safe Python sandbox)
-# General knowledge: uses LLM if key; else free web (DuckDuckGo + Wikipedia)
+# General knowledge: uses LLM if key; else free web (DuckDuckGo + Wikipedia search→summary)
 # Endpoints: GET / , GET /health , POST /chat , GET /widget (302→/w) , GET /w , GET /widget_debug
 
-from typing import Literal, Optional, Dict, Any, List
+from typing import Literal, Optional, Dict, Any
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import HTMLResponse, Response, RedirectResponse
@@ -408,30 +408,59 @@ def code_run_tool(text: str) -> Dict[str, Any]:
         return {"error": f"Code tool failed: {e}"}
 
 # ===================
-# General knowledge (LLM if key; else free web)
+# General knowledge (LLM if key; else free web via Wikipedia search→summary, then DDG)
 # ===================
-def _get_json(url: str, timeout: float=5.0) -> Optional[Dict[str,Any]]:
+def _get_json(url: str, timeout: float = 6.0, headers: Optional[Dict[str, str]] = None) -> Optional[Dict[str, Any]]:
     try:
-        req = urllib.request.Request(url, headers={"User-Agent":"Slate/0.6"})
+        base = {
+            "User-Agent": "Slate/0.6 (+https://slate-ai.onrender.com)",
+            "Accept": "application/json",
+        }
+        if headers:
+            base.update(headers)
+        req = urllib.request.Request(url, headers=base)
         with urllib.request.urlopen(req, timeout=timeout, context=_ssl_ctx) as r:
-            return json.loads(r.read().decode("utf-8","ignore"))
+            return json.loads(r.read().decode("utf-8", "ignore"))
     except Exception:
         return None
 
 def _ddg_instant(q: str) -> Dict[str, Any]:
-    url = "https://api.duckduckgo.com/?"+urllib.parse.urlencode({"q":q,"format":"json","no_html":"1","skip_disambig":"1"})
+    url = "https://api.duckduckgo.com/?" + urllib.parse.urlencode({
+        "q": q,
+        "format": "json",
+        "no_html": "1",
+        "skip_disambig": "1",
+    })
     j = _get_json(url) or {}
     text = (j.get("AbstractText") or "").strip()
     src  = (j.get("AbstractURL") or "").strip()
     return {"text": text, "url": src}
 
-def _wiki_summary(q: str) -> Dict[str, Any]:
-    title = urllib.parse.quote(q.strip().replace(" ","_"))
-    url = f"https://en.wikipedia.org/api/rest_v1/page/summary/{title}"
+# --- Wikipedia search -> summary (handles natural questions) ---
+def _wiki_search_title(q: str) -> Optional[str]:
+    url = "https://en.wikipedia.org/w/api.php?" + urllib.parse.urlencode({
+        "action": "query", "list": "search", "srsearch": q, "srlimit": 1, "format": "json", "utf8": 1
+    })
+    j = _get_json(url)
+    if not j:
+        return None
+    items = j.get("query", {}).get("search", [])
+    return items[0]["title"] if items else None
+
+def _wiki_summary_by_title(title: str) -> Dict[str, Any]:
+    t = urllib.parse.quote((title or "").strip().replace(" ", "_"))
+    url = f"https://en.wikipedia.org/api/rest_v1/page/summary/{t}"
     j = _get_json(url) or {}
     text = (j.get("extract") or "").strip()
-    page = (j.get("content_urls",{}).get("desktop",{}).get("page") or f"https://en.wikipedia.org/wiki/{title}")
+    page = (j.get("content_urls", {}).get("desktop", {}).get("page")
+            or f"https://en.wikipedia.org/wiki/{t}")
     return {"text": text, "url": page}
+
+def _wiki_best_summary(q: str) -> Dict[str, Any]:
+    title = _wiki_search_title(q)
+    if not title:
+        return {}
+    return _wiki_summary_by_title(title)
 
 def _llm_general(query: str) -> Optional[str]:
     # OpenAI
@@ -474,16 +503,33 @@ def _llm_general(query: str) -> Optional[str]:
     return None
 
 def general_qa_tool(query: str) -> Dict[str, Any]:
+    # quick special-case for “how to say X in Spanish”
+    m = re.match(r"\s*how\s+to\s+say\s+['\"]?(.+?)['\"]?\s+in\s+spanish\??\s*$", (query or "").lower())
+    if m:
+        term = m.group(1).strip()
+        if term == "only":
+            return {"type": "general", "engine": "builtin",
+                    "answer": "“solo”, “solamente”, or “únicamente”. (Modern usage writes ‘solo’ without an accent except to avoid ambiguity.)",
+                    "sources": []}
+
     llm = _llm_general(query)
     if llm:
         return {"type":"general","engine":"llm","answer": llm, "sources":[]}
+
+    # Use Wikipedia search→summary first (works for question phrasing)
+    wiki = _wiki_best_summary(query)
+    if wiki.get("text"):
+        return {"type":"general","engine":"web","answer": wiki["text"], "sources":[wiki["url"]]}
+
+    # Then try DDG Instant Answer
     ddg = _ddg_instant(query)
     if ddg.get("text"):
-        return {"type":"general","engine":"web","answer": ddg["text"], "sources":[ddg.get("url")] if ddg.get("url") else []}
-    wiki = _wiki_summary(query)
-    if wiki.get("text"):
-        return {"type":"general","engine":"web","answer": wiki["text"], "sources":[wiki.get("url")] if wiki.get("url") else []}
-    return {"type":"general","engine":"none","answer":"I couldn’t find a solid quick answer. Try rephrasing or ask something more specific.", "sources":[]}
+        urls = [ddg["url"]] if ddg.get("url") else []
+        return {"type":"general","engine":"web","answer": ddg["text"], "sources": urls}
+
+    return {"type":"general","engine":"none",
+            "answer":"I couldn’t find a solid quick answer. Try rephrasing or ask something more specific.",
+            "sources":[]}
 
 # =========
 # API layer
@@ -546,7 +592,7 @@ NEW_WIDGET_HTML = """<!doctype html>
   .u{margin-left:auto;background:#101014}
   .b{margin-right:auto;background:#0f0f12}
   .input{display:flex;gap:8px}
-  textarea{flex:1;background:#0f0f12;color:var(--text);border:1px solid #26262c;border-radius:10px;padding:10px;min-height:48px}
+  textarea{flex:1;background:#0f0f12;color:#var(--text);border:1px solid #26262c;border-radius:10px;padding:10px;min-height:48px}
   button{background:var(--accent);color:#fff;border:0;border-radius:10px;padding:0 14px;cursor:pointer;font-weight:600}
   .hint{color:var(--muted);font-size:12px}
   .tips{background:#0f0f12;border:1px solid #222226;border-radius:10px;padding:10px;font-size:12px;color:#a1a1aa}
