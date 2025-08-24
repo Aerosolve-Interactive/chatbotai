@@ -3,14 +3,14 @@
 # - Writing coach (shorten/explain/rewrite). Uses OpenAI if OPENAI_API_KEY is set; else safe fallback.
 # - Safe Python code runner (no network/shell; CPU/RAM/time limits)
 # - Never 500s (all exceptions returned as JSON)
-# Endpoints: GET / , GET /health , POST /chat
+# Endpoints: GET / , GET /health , POST /chat , GET /widget , GET /w , GET /widget_debug
 
 from typing import Literal, Optional, Dict, Any
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import HTMLResponse, Response
 from pydantic import BaseModel
-import os, re, tempfile, subprocess, sys, textwrap, json
+import os, re, tempfile, subprocess, sys
 
 # ========== Math stack ==========
 import sympy as sp
@@ -327,30 +327,33 @@ def index():
       <ul>
         <li><a href="/health" style="color:#8b5cf6">/health</a></li>
         <li><a href="/docs" style="color:#8b5cf6">/docs</a> (test POST /chat here)</li>
+        <li><a href="/widget?v=2" style="color:#8b5cf6">/widget</a> · <a href="/w?v=1" style="color:#8b5cf6">/w</a></li>
       </ul>
     </body></html>
     """
 
-# --- Minimal widget served from the API itself (/widget) ---
+# -------------------------------
+# Hardened widget at /widget
+# -------------------------------
 WIDGET_HTML = """<!doctype html>
 <html lang="en"><head>
 <meta charset="utf-8"/><meta name="viewport" content="width=device-width,initial-scale=1"/>
 <title>Slate — Study Assistant</title>
 <style>
-  :root{--bg:#0b0b0c;--panel:#121214;--panel-2:#17171a;--text:#e7e7ea;--muted:#a1a1aa;--accent:#8b5cf6;--radius:16px;--shadow:0 10px 30px rgba(0,0,0,.35)}
-  *{box-sizing:border-box} html,body{height:100%} body{margin:0;font-family:ui-sans-serif,system-ui,-apple-system,Inter,Segoe UI,Roboto,Arial;background:var(--bg);color:var(--text);line-height:1.5}
-  .wrap{display:flex;flex-direction:column;height:100%;padding:16px;background:linear-gradient(180deg, rgba(255,255,255,.03), transparent 20%)}
-  .card{flex:1;display:flex;flex-direction:column;background:var(--panel);border:1px solid #222226;border-radius:16px;box-shadow:var(--shadow);overflow:hidden}
-  .header{display:flex;align-items:center;justify-content:space-between;padding:14px 16px;border-bottom:1px solid #222226;background:var(--panel-2)}
+  :root{--bg:#0b0b0c;--panel:#121214;--panel-2:#17171a;--text:#e7e7ea;--muted:#a1a1aa;--accent:#8b5cf6}
+  *{box-sizing:border-box} html,body{height:100%} body{margin:0;font-family:ui-sans-serif,system-ui,Inter;background:var(--bg);color:var(--text)}
+  .wrap{display:flex;flex-direction:column;height:100%;padding:16px}
+  .card{flex:1;display:flex;flex-direction:column;background:var(--panel);border:1px solid #222226;border-radius:16px;overflow:hidden}
+  .header{display:flex;align-items:center;justify-content:space-between;padding:14px 16px;border-bottom:1px solid #222226;background:#17171a}
   .brand{display:flex;gap:10px;align-items:center;font-weight:700}.dot{width:10px;height:10px;border-radius:50%;background:var(--accent);box-shadow:0 0 16px var(--accent)}
   .seg{display:inline-flex;background:#0f0f12;padding:4px;border-radius:999px;border:1px solid #1f1f24}
   .seg button{background:transparent;border:0;color:var(--muted);padding:6px 12px;border-radius:999px;cursor:pointer;font-size:12px}
-  .seg button.active{background:var(--panel-2);color:var(--text);border:1px solid #2a2a31}
+  .seg button.active{background:#17171a;color:var(--text);border:1px solid #2a2a31}
   .chat{flex:1;overflow:auto;padding:16px;display:flex;flex-direction:column;gap:12px}
-  .msg{max-width:88%;padding:10px 12px;border-radius:12px;font-size:14px;white-space:pre-wrap;word-wrap:break-word;border:1px solid #24242a}
+  .msg{max-width:88%;padding:10px 12px;border-radius:12px;font-size:14px;white-space:pre-wrap;border:1px solid #24242a}
   .msg.user{align-self:flex-end;background:#101014;border-color:#2a2a31}.msg.bot{align-self:flex-start;background:#0f0f12}
-  .footer{display:flex;gap:8px;padding:12px;border-top:1px solid #222226;background:var(--panel-2)}
-  textarea{flex:1;resize:none;background:#0f0f12;color:#e7e7ea;border:1px solid #26262c;border-radius:12px;padding:10px 12px;min-height:48px;max-height:160px;outline:none}
+  .footer{display:flex;gap:8px;padding:12px;border-top:1px solid #222226;background:#17171a}
+  textarea{flex:1;resize:none;background:#0f0f12;color:#e7e7ea;border:1px solid #26262c;border-radius:12px;padding:10px 12px;min-height:48px;max-height:160px}
   .send{background:var(--accent);color:#fff;border:0;border-radius:12px;padding:0 16px;cursor:pointer;font-weight:600}
   .hint{color:var(--muted);font-size:12px;padding:0 14px 12px}
 </style>
@@ -360,130 +363,218 @@ WIDGET_HTML = """<!doctype html>
     <div class="card">
       <div class="header">
         <div class="brand"><span class="dot"></span><span>Slate</span><span style="color:#a1a1aa;font-size:12px">· math · code · writing</span></div>
-        <div id="slate-seg" class="seg" role="tablist" aria-label="Mode">
+        <div id="sl-seg" class="seg" role="tablist" aria-label="Mode">
           <button class="active" data-mode="auto">Auto</button>
           <button data-mode="math">Math</button>
           <button data-mode="code">Code</button>
           <button data-mode="write">Writing</button>
         </div>
       </div>
-      <div id="slate-chat" class="chat" aria-live="polite"></div>
+      <div id="sl-chat" class="chat" aria-live="polite"></div>
       <div class="hint">Enter to send • Shift+Enter for newline</div>
       <div class="footer">
-        <textarea id="slate-input" placeholder="Ask in plain English. e.g., ‘Find the roots of x^2 - 5x + 6’ or ‘Shorten to 120 words: …’"></textarea>
-        <button id="slate-send" class="send" type="button">Send</button>
+        <textarea id="sl-input" placeholder="Ask in plain English. e.g., ‘Find the roots of x^2 - 5x + 6’ or ‘Shorten to 120 words: …’"></textarea>
+        <button id="sl-send" class="send" type="button">Send</button>
       </div>
     </div>
   </div>
 
 <script>
-document.addEventListener("DOMContentLoaded", function () {
-  const BACKEND_URL = "https://slate-ai.onrender.com";
+(function(){
+  const BACKEND_URL = location.origin; // same-origin = no CORS issues
+  const chat  = document.getElementById("sl-chat");
+  const input = document.getElementById("sl-input");
+  const send  = document.getElementById("sl-send");
+  const seg   = document.getElementById("sl-seg");
+  let mode="auto", sending=false, warmed=false;
 
-  const chat = document.getElementById("slate-chat");
-  const input = document.getElementById("slate-input");
-  const sendBtn = document.getElementById("slate-send");
-  const seg = document.getElementById("slate-seg");
-  let currentMode = "auto";
-  let sending = false;
-  let warmedOnce = false;
-
-  seg.querySelectorAll("button").forEach(btn => {
-    btn.addEventListener("click", () => {
-      seg.querySelectorAll("button").forEach(b => b.classList.remove("active"));
-      btn.classList.add("active");
-      currentMode = btn.dataset.mode;
+  seg.querySelectorAll("button").forEach(b=>{
+    b.addEventListener("click", ()=>{
+      seg.querySelectorAll("button").forEach(x=>x.classList.remove("active"));
+      b.classList.add("active"); mode=b.dataset.mode;
     });
   });
 
-  function addMsg(text, who="bot"){
-    const div = document.createElement("div");
-    div.className = "msg " + (who === "user" ? "user" : "bot");
-    div.textContent = text;
-    chat.appendChild(div);
-    chat.scrollTop = chat.scrollHeight;
+  function add(text, who="bot"){
+    const d=document.createElement("div");
+    d.className="msg "+(who==="user"?"user":"bot");
+    d.textContent=text; chat.appendChild(d); chat.scrollTop=chat.scrollHeight;
   }
 
-  function renderResult(obj){
-    if(!obj) return addMsg("No response.","bot");
-    if(obj.error) return addMsg("Error: " + obj.error, "bot");
-    const {mode, result} = obj;
-    if(mode === "math"){
-      if(result.error) return addMsg("Math error: " + result.error, "bot");
-      if(result.type === "solve"){
-        addMsg(`Equation: ${result.equation}\nSymbol: ${result.symbol}\nSolution: ${JSON.stringify(result.solution, null, 2)}`, "bot");
-      } else if(result.type === "diff"){
-        addMsg(`d/dx of ${result.expr} = ${result["d/dx"]}`, "bot");
-      } else if(result.type === "integrate"){
-        addMsg(`∫ ${result.expr} dx = ${result["∫dx"]}`, "bot");
-      } else if(result.type === "simplify"){
-        addMsg(`Simplified ${result.expr} → ${result.simplified}`, "bot");
-      } else if(result.type === "eval"){
-        if(result.value !== undefined) addMsg(`Value: ${result.value}`, "bot");
-        else addMsg(`Simplified ${result.expr} → ${result.simplified}`, "bot");
-      } else addMsg(JSON.stringify(result), "bot");
-    } else if(mode === "code"){
-      if(result.error) return addMsg("Code error: " + result.error, "bot");
-      if(result.syntax === "error") return addMsg("Syntax error: " + result.detail, "bot");
-      if(result.timeout) return addMsg("Your code timed out (3s limit).", "bot");
-      const out = [];
-      out.push("Ran ✅");
-      if(result.stdout) out.push("stdout:\n" + result.stdout.trim());
-      if(result.stderr) out.push("stderr:\n" + result.stderr.trim());
-      addMsg(out.join("\\n\\n"), "bot");
-    } else if(mode === "write"){
-      if(result.error) return addMsg("Writing error: " + result.error, "bot");
-      addMsg(result.output || JSON.stringify(result), "bot");
-    } else {
-      addMsg(JSON.stringify(result), "bot");
+  function render(obj){
+    if(!obj) return add("No response.","bot");
+    if(obj.error) return add("Error: "+obj.error,"bot");
+    const {mode, result}=obj;
+    if(mode==="math"){
+      if(result.error) return add("Math error: "+result.error,"bot");
+      if(result.type==="eval" && result.value!==undefined) return add("Value: "+result.value,"bot");
+      if(result.type==="simplify") return add(`Simplified ${result.expr} → ${result.simplified}`,"bot");
+      if(result.type==="diff") return add(`d/dx of ${result.expr} = ${result["d/dx"]}`,"bot");
+      if(result.type==="integrate") return add(`∫ ${result.expr} dx = ${result["∫dx"]}`,"bot");
+      if(result.type==="solve") return add(`Equation: ${result.equation}\nSymbol: ${result.symbol}\nSolution: ${JSON.stringify(result.solution,null,2)}`,"bot");
+      return add(JSON.stringify(result),"bot");
     }
+    if(mode==="code"){
+      if(result.error) return add("Code error: "+result.error,"bot");
+      if(result.syntax==="error") return add("Syntax error: "+result.detail,"bot");
+      if(result.timeout) return add("Your code timed out (3s limit).","bot");
+      let out="Ran ✅";
+      if(result.stdout) out+="\nstdout:\n"+result.stdout.trim();
+      if(result.stderr) out+="\nstderr:\n"+result.stderr.trim();
+      return add(out,"bot");
+    }
+    // write
+    if(result.error) return add("Writing error: "+result.error,"bot");
+    return add(result.output || JSON.stringify(result),"bot");
   }
 
-  async function handleSend(){
+  async function go(){
     if(sending) return;
-    const text = input.value.trim();
-    if(!text) return;
-    addMsg(text, "user");
-    input.value = "";
-    sending = true;
+    const text=(input.value||"").trim(); if(!text) return;
+    add(text,"user"); input.value=""; sending=true;
 
-    let wakeHint = setTimeout(() => addMsg("…waking the server (free tier cold start)…", "bot"), 1200);
-
+    let hint=setTimeout(()=>add("…waking the server…","bot"),1200);
     try{
-      const resp = await fetch(BACKEND_URL + "/chat", {
-        method: "POST",
-        headers: {"Content-Type":"application/json"},
-        body: JSON.stringify({ mode: currentMode, text })
-      });
-      const data = await resp.json();
-      clearTimeout(wakeHint);
-      renderResult(data);
-
-      if(!warmedOnce){
-        warmedOnce = true;
-        setTimeout(() => {
-          fetch(BACKEND_URL + "/health", { method:"HEAD", cache:"no-store" }).catch(() => {});
-        }, 2 * 60 * 1000);
-      }
-    } catch(e){
-      clearTimeout(wakeHint);
-      addMsg("Network error: " + e.message, "bot");
-    } finally {
-      sending = false;
-    }
+      const r=await fetch(BACKEND_URL+"/chat",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({mode,text})});
+      const j=await r.json(); clearTimeout(hint); render(j);
+      if(!warmed){ warmed=true; setTimeout(()=>{ fetch(BACKEND_URL+"/health",{method:"HEAD"}).catch(()=>{}); }, 120000); }
+    }catch(e){ clearTimeout(hint); add("Network error: "+e.message,"bot"); }
+    finally{ sending=false; }
   }
 
-  sendBtn.addEventListener("click", handleSend);
-  input.addEventListener("keydown", (e) => {
-    if(e.key === "Enter" && !e.shiftKey){ e.preventDefault(); handleSend(); }
-  });
+  send.addEventListener("click", go);
+  input.addEventListener("keydown", (e)=>{ if(e.key==="Enter" && !e.shiftKey){ e.preventDefault(); go(); } });
 
-  addMsg("Hi! I’m Slate. I can solve math (exact via SymPy), run small Python, and polish writing (shorten/explain/rewrite). Try: ‘find the roots of x^2 - 5x + 6’.", "bot");
-});
+  add("Hi! I’m Slate. Try: ‘what is 8*8’.","bot");
+})();
 </script>
 </body></html>"""
 
-# --- Diagnostic page to verify JS + API from same origin (/widget_debug) ---
+@app.get("/widget", response_class=HTMLResponse)
+def widget():
+    return HTMLResponse(content=WIDGET_HTML, headers={"Cache-Control": "no-store"})
+
+# -------------------------------
+# Ultra-minimal widget at /w
+# -------------------------------
+NEW_WIDGET_HTML = """<!doctype html>
+<html lang="en"><head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width,initial-scale=1"/>
+<title>Slate — Minimal Widget</title>
+<style>
+  :root{--bg:#0b0b0c;--panel:#121214;--panel2:#17171a;--text:#e7e7ea;--muted:#a1a1aa;--accent:#8b5cf6}
+  *{box-sizing:border-box} html,body{height:100%} body{margin:0;background:var(--bg);color:var(--text);font-family:ui-sans-serif,system-ui,Inter}
+  .wrap{display:flex;flex-direction:column;gap:12px;height:100%;padding:16px}
+  .bar{display:flex;gap:8px;align-items:center}
+  .tab{border:1px solid #2a2a31;background:#0f0f12;color:var(--muted);padding:6px 10px;border-radius:999px;cursor:pointer;font-size:12px}
+  .tab.active{color:#fff;background:var(--panel2)}
+  .box{flex:1;overflow:auto;background:var(--panel);border:1px solid #222226;border-radius:12px;padding:12px}
+  .msg{max-width:85%;padding:8px 10px;border-radius:10px;border:1px solid #2a2a31;margin:6px 0;white-space:pre-wrap}
+  .u{margin-left:auto;background:#101014}
+  .b{margin-right:auto;background:#0f0f12}
+  .input{display:flex;gap:8px}
+  textarea{flex:1;background:#0f0f12;color:var(--text);border:1px solid #26262c;border-radius:10px;padding:10px;min-height:48px}
+  button{background:var(--accent);color:#fff;border:0;border-radius:10px;padding:0 14px;cursor:pointer;font-weight:600}
+</style>
+</head>
+<body>
+  <div class="wrap">
+    <div class="bar">
+      <strong>Slate</strong>
+      <div style="flex:1"></div>
+      <button class="tab active" data-w-mode="auto">Auto</button>
+      <button class="tab" data-w-mode="math">Math</button>
+      <button class="tab" data-w-mode="code">Code</button>
+      <button class="tab" data-w-mode="write">Writing</button>
+    </div>
+    <div id="w-chat" class="box" aria-live="polite"></div>
+    <div class="input">
+      <textarea id="w-input" placeholder="Try: what is 8*8  ·  or  find the roots of x^2-5x+6"></textarea>
+      <button id="w-send" type="button">Send</button>
+    </div>
+  </div>
+
+<script>
+(function(){
+  const BACKEND_URL = location.origin;  // same-origin
+  const chat  = document.getElementById("w-chat");
+  const input = document.getElementById("w-input");
+  const send  = document.getElementById("w-send");
+  const tabs  = Array.from(document.querySelectorAll("[data-w-mode]"));
+  let mode = "auto", sending = false, warmed = false;
+
+  tabs.forEach(btn => btn.addEventListener("click", () => {
+    tabs.forEach(t => t.classList.remove("active"));
+    btn.classList.add("active");
+    mode = btn.dataset.wMode;  // "math"|"code"|"write"|"auto"
+  }));
+
+  function add(text, who){
+    const d = document.createElement("div");
+    d.className = "msg " + (who === "user" ? "u" : "b");
+    d.textContent = text;
+    chat.appendChild(d); chat.scrollTop = chat.scrollHeight;
+  }
+
+  function render(obj){
+    if(!obj) return add("No response.","bot");
+    if(obj.error) return add("Error: " + obj.error, "bot");
+    const {mode, result} = obj;
+    if(mode === "math"){
+      if(result.error) return add("Math error: " + result.error, "bot");
+      if(result.type === "eval" && result.value !== undefined) return add("Value: " + result.value, "bot");
+      return add(JSON.stringify(result), "bot");
+    }
+    if(mode === "code"){
+      if(result.error) return add("Code error: " + result.error, "bot");
+      let out = "Ran ✅";
+      if(result.stdout) out += "\\nstdout:\\n" + result.stdout.trim();
+      if(result.stderr) out += "\\nstderr:\\n" + result.stderr.trim();
+      return add(out, "bot");
+    }
+    if(result.error) return add("Writing error: " + result.error, "bot");
+    return add(result.output || JSON.stringify(result), "bot");
+  }
+
+  async function go(){
+    if(sending) return;
+    const text = (input.value || "").trim();
+    if(!text) return;
+    add(text, "user");
+    input.value = "";
+    sending = true;
+
+    let nudge = setTimeout(()=>add("…waking the server…","bot"), 1200);
+    try{
+      const r = await fetch(BACKEND_URL + "/chat", {
+        method:"POST", headers:{"Content-Type":"application/json"},
+        body: JSON.stringify({ mode, text })
+      });
+      const j = await r.json();
+      clearTimeout(nudge); render(j);
+
+      if(!warmed){ warmed = true; setTimeout(()=>{ fetch(BACKEND_URL + "/health", {method:"HEAD"}).catch(()=>{}); }, 120000); }
+    }catch(e){
+      clearTimeout(nudge); add("Network error: " + e.message, "bot");
+    }finally{ sending = false; }
+  }
+
+  send.addEventListener("click", go);
+  input.addEventListener("keydown", e => { if(e.key==="Enter" && !e.shiftKey){ e.preventDefault(); go(); } });
+
+  add("Hi! I’m Slate. Try: “what is 8*8”.", "bot");
+})();
+</script>
+</body></html>"""
+
+@app.get("/w", response_class=HTMLResponse)
+def widget_min():
+    return HTMLResponse(content=NEW_WIDGET_HTML, headers={"Cache-Control": "no-store"})
+
+# --------------------------------
+# Diagnostic page at /widget_debug
+# --------------------------------
 DIAG_HTML = """<!doctype html>
 <html lang="en"><head>
 <meta charset="utf-8"/><meta name="viewport" content="width=device-width,initial-scale=1"/>
@@ -543,19 +634,16 @@ DIAG_HTML = """<!doctype html>
       log("Network error: " + e.message);
     }
   });
-
 </script>
 </body></html>"""
 
 @app.get("/widget_debug", response_class=HTMLResponse)
 def widget_debug():
-    return DIAG_HTML
+    return HTMLResponse(content=DIAG_HTML, headers={"Cache-Control": "no-store"})
 
-
-@app.get("/widget", response_class=HTMLResponse)
-def widget():
-    return WIDGET_HTML
-
+# ----------------
+# Misc endpoints
+# ----------------
 @app.get("/favicon.ico")
 def favicon():
     return Response(content=b"", media_type="image/x-icon")
