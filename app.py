@@ -452,6 +452,75 @@ WIDGET_HTML = """<!doctype html>
 </script>
 </body></html>"""
 
+# --- Diagnostic page to verify JS + API from same origin (/widget_debug) ---
+DIAG_HTML = """<!doctype html>
+<html lang="en"><head>
+<meta charset="utf-8"/><meta name="viewport" content="width=device-width,initial-scale=1"/>
+<title>Slate Widget Debug</title>
+<style>
+  body{background:#0b0b0c;color:#e7e7ea;font-family:ui-sans-serif;margin:0;padding:16px}
+  button{background:#8b5cf6;color:#fff;border:0;border-radius:10px;padding:8px 12px;margin-right:8px;cursor:pointer}
+  pre{white-space:pre-wrap;background:#121214;border:1px solid #222226;border-radius:12px;padding:12px;margin-top:12px}
+</style>
+</head>
+<body>
+  <h3>Widget Debug</h3>
+  <div>
+    <button id="b1">Toggle Mode</button>
+    <button id="b2">Send “what is 2+2”</button>
+    <button id="b3">Ping /health (HEAD)</button>
+  </div>
+  <pre id="log">Booting…</pre>
+
+<script>
+  const BACKEND_URL = location.origin;  // same-origin
+  const logEl = document.getElementById('log');
+  const log = (m) => { logEl.textContent += "\\n" + m; };
+
+  window.addEventListener('error', e => { log("JS ERROR: " + e.message); });
+
+  log("Boot OK (JS loaded). UserAgent=" + navigator.userAgent);
+
+  let mode = "auto";
+  document.getElementById('b1').addEventListener('click', () => {
+    mode = (mode === "auto" ? "math" : "auto");
+    log("Mode now: " + mode);
+  });
+
+  document.getElementById('b2').addEventListener('click', async () => {
+    log("POST /chat …");
+    try {
+      const r = await fetch(BACKEND_URL + "/chat", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ mode, text: "what is 2+2" })
+      });
+      log("Status: " + r.status);
+      const j = await r.json();
+      log("Body: " + JSON.stringify(j));
+    } catch (e) {
+      log("Network error: " + e.message);
+    }
+  });
+
+  document.getElementById('b3').addEventListener('click', async () => {
+    log("HEAD /health …");
+    try {
+      const r = await fetch(BACKEND_URL + "/health", { method: "HEAD", cache: "no-store" });
+      log("HEAD status: " + r.status);
+    } catch (e) {
+      log("Network error: " + e.message);
+    }
+  });
+
+</script>
+</body></html>"""
+
+@app.get("/widget_debug", response_class=HTMLResponse)
+def widget_debug():
+    return DIAG_HTML
+
+
 @app.get("/widget", response_class=HTMLResponse)
 def widget():
     return WIDGET_HTML
