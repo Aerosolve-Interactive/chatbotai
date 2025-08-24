@@ -403,16 +403,16 @@ WIDGET_HTML = """<!doctype html>
     if(mode==="math"){
       if(result.error) return addMsg("Math error: "+result.error,"bot");
       if(result.type==="solve"){
-        addMsg(`Equation: ${result.equation}\nSymbol: ${result.symbol}\nSolution: ${JSON.stringify(result.solution,null,2)}`,"bot");
+        addMsg(\`Equation: \${result.equation}\nSymbol: \${result.symbol}\nSolution: \${JSON.stringify(result.solution,null,2)}\`,"bot");
       } else if(result.type==="diff"){
-        addMsg(`d/dx of ${result.expr} = ${result["d/dx"]}`,"bot");
+        addMsg(\`d/dx of \${result.expr} = \${result["d/dx"]}\`,"bot");
       } else if(result.type==="integrate"){
-        addMsg(`∫ ${result.expr} dx = ${result["∫dx"]}`,"bot");
+        addMsg(\`∫ \${result.expr} dx = \${result["∫dx"]}\`,"bot");
       } else if(result.type==="simplify"){
-        addMsg(`Simplified ${result.expr} → ${result.simplified}`,"bot");
+        addMsg(\`Simplified \${result.expr} → \${result.simplified}\`,"bot");
       } else if(result.type==="eval"){
-        if(result.value!==undefined) addMsg(`Value: ${result.value}`,"bot");
-        else addMsg(`Simplified ${result.expr} → ${result.simplified}`,"bot");
+        if(result.value!==undefined) addMsg(\`Value: \${result.value}\`,"bot");
+        else addMsg(\`Simplified \${result.expr} → \${result.simplified}\`,"bot");
       } else { addMsg(JSON.stringify(result),"bot"); }
     } else if(mode==="code"){
       if(result.error) return addMsg("Code error: "+result.error,"bot");
@@ -428,7 +428,8 @@ WIDGET_HTML = """<!doctype html>
     } else { addMsg(JSON.stringify(result),"bot"); }
   }
 
-  async function send(){
+  // renamed to avoid clobbering with element id="send"
+  async function handleSend(){
     if(sending) return;
     const text=input.value.trim(); if(!text) return;
     addMsg(text,"user"); input.value=""; sending=true;
@@ -444,8 +445,8 @@ WIDGET_HTML = """<!doctype html>
     finally{ sending=false; }
   }
 
-  sendBtn.addEventListener("click", send);
-  input.addEventListener("keydown",(e)=>{ if(e.key==="Enter" && !e.shiftKey){ e.preventDefault(); send(); } });
+  sendBtn.addEventListener("click", handleSend);
+  input.addEventListener("keydown",(e)=>{ if(e.key==="Enter" && !e.shiftKey){ e.preventDefault(); handleSend(); } });
 
   addMsg("Hi! I’m Slate. I solve math exactly (SymPy), run tiny Python snippets, and polish writing (shorten/explain/rewrite).","bot");
 </script>
